@@ -3,7 +3,7 @@ import math
 import torch
 import json
 import numpy as np
-
+import time
 import rclpy
 from rclpy.node import Node
 
@@ -24,6 +24,8 @@ from nav_msgs.msg import Path
 from geometry_msgs.msg import PoseStamped
 from ackermann_msgs.msg import AckermannDrive
 
+# Add this line:
+from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy
 
 class LaneVisualizer(Node):
     def __init__(self):
@@ -66,25 +68,30 @@ class LaneVisualizer(Node):
             self._on_image,
             10
         )
-        self._control_pub = self.create_publisher(AckermannDrive, "/ackermann_cmd", 1)
+        # Copying the QoS profile from drive.py
+        streaming_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE 
+        )
+        self._control_pub = self.create_publisher(AckermannDrive, "/ackermann_cmd", streaming_qos)
+        #self._control_pub = self.create_publisher(AckermannDrive, "/ackermann_cmd", 1)
         self.L = 1.75
+        self._prev_steer = 0.0
 
     def stanley_lateral_controller(self, current_he, current_xte, current_speed):
-        """
-        Calculates steering based on Heading Error and Cross-Track Error.
-        """
-        k = 1.0 # Control Gain. Increase if it's sluggish, decrease if it oscillates.
-        
-        # Prevent division by zero if speed is 0
-        v = max(current_speed, 0.1) 
-        
-        # Stanley formula
-        steering = current_he + math.atan2(k * current_xte, v)
-        
-        # Clip steering to GEM e2 limits (roughly +/- 0.8 rad)
-        steering = np.clip(steering, -0.8, 0.8)
-        
-        return steering
+            """
+            Calculates steering based on Heading Error and Cross-Track Error.
+            """
+            k = 0.5 # Softened the gain slightly
+            v = max(current_speed, 0.1) 
+            
+            # FLIPPED THE SIGN ON XTE:
+            # If XTE is positive (lane is to the right), we need a negative steering angle (steer right)
+            steering = current_he + math.atan2(-k * current_xte, v)
+            
+            steering = np.clip(steering, -0.8, 0.8)
+            return steering
 
     def longitudinal_controller(self, current_he):
         """
@@ -124,25 +131,107 @@ class LaneVisualizer(Node):
         binary_BEV = np.pad(binary_BEV, ((0, 100), (0, 0)))
         binary_BEV = cv2.cvtColor(binary_BEV, cv2.COLOR_GRAY2BGR)
         
-        if ret:                
-            poly_px = (np.add(ret["left_fit"], ret["right_fit"]) / 2)
-            est_xte_val, est_he_val, camera_px, closest_px = self.compute_error(poly_px)
-            
-            # --- CALCULATE CONTROL COMMANDS (Stanley) ---
-            target_speed = self.longitudinal_controller(est_he_val)
-            target_steering = self.stanley_lateral_controller(est_he_val, est_xte_val, target_speed)
+        if ret:
+            left_fit = ret["left_fit"]
+            right_fit = ret["right_fit"]
 
-            # --- PUBLISH TO GEM CAR ---
+            # --- 1. EVALUATE POLYNOMIALS ---
+            lookahead_y_px = 350
+            
+            left_lookahead_x = np.polyval(left_fit, lookahead_y_px)
+            right_lookahead_x = np.polyval(right_fit, lookahead_y_px)
+            
+            # Evaluate at the bumper to see which line is closest to the car
+            left_bumper_x = np.polyval(left_fit, 600)
+            right_bumper_x = np.polyval(right_fit, 600)
+
+            # --- 2. DYNAMIC LANE WEIGHTING ---
+            NOMINAL_WIDTH = 170 
+            MAX_WIDTH = 250 # If the lane is wider than this, a line is hallucinating
+            MIN_WIDTH = 80  # If the lane is narrower than this, lines are crossing
+            
+            # Calculate the current observed width
+            current_width = right_lookahead_x - left_lookahead_x
+
+            # Calculate distance from center of bumper (x = 400)
+            dist_left = abs(left_bumper_x - 400.0)
+            dist_right = abs(right_bumper_x - 400.0)
+
+            # HARD CUTOFF: If the lane is impossibly wide or narrow
+            if current_width > MAX_WIDTH or current_width < MIN_WIDTH:
+                # Force 100% trust on the line closest to the car's center
+                if dist_left < dist_right:
+                    weight_left = 1.0
+                    weight_right = 0.0
+                else:
+                    weight_left = 0.0
+                    weight_right = 1.0
+            else:
+                # NORMAL BLENDING: Use inverse distance weighting
+                weight_left = 1.0 / ((dist_left + 10.0) ** 2)
+                weight_right = 1.0 / ((dist_right + 10.0) ** 2)
+                
+                # Normalize so weights sum to 1.0
+                total_weight = weight_left + weight_right
+                weight_left /= total_weight
+                weight_right /= total_weight
+
+            # What is the target if we ONLY trust the left line?
+            target_from_left = left_lookahead_x + (NOMINAL_WIDTH / 2.0)
+            
+            # What is the target if we ONLY trust the right line?
+            target_from_right = right_lookahead_x - (NOMINAL_WIDTH / 2.0)
+
+            # Blend the targets! 
+            target_x_px = (weight_left * target_from_left) + (weight_right * target_from_right)
+
+            # --- 3. CONVERT PIXELS TO METERS (Car Frame) ---
+            Sy, Sx = self._bev_cfg["unit_conversion_factor"]
+            
+            x_forward_m = (600 - lookahead_y_px) * Sy
+            y_lateral_m = -(target_x_px - 400.0) * Sx
+
+            # --- 4. PURE PURSUIT CONTROLLER ---
+            ld = math.hypot(x_forward_m, y_lateral_m)
+            if ld > 0.001:
+                alpha = math.atan2(y_lateral_m, x_forward_m)
+                base_steering = math.atan2(2 * self.L * math.sin(alpha), ld)
+                
+                steering_gain = 1.6 
+                raw_steering = base_steering * steering_gain
+            else:
+                raw_steering = 0.0
+            
+            raw_steering = np.clip(raw_steering, -0.8, 0.8)
+
+            # --- UPGRADE A: TEMPORAL SMOOTHING (LOW-PASS FILTER) ---
+            # Neural networks jitter frame-to-frame. We blend the new steering command 
+            # with the previous one to act as "suspension" for the steering wheel.
+            # 0.3 means we trust 30% of the new frame and keep 70% of the old momentum.
+            alpha_filter = 0.6
+            target_steering = (alpha_filter * raw_steering) + ((1.0 - alpha_filter) * self._prev_steer)
+            self._prev_steer = target_steering # Save for the next frame
+
+            # --- UPGRADE B: DYNAMIC SPEED CONTROL ---
+            # Humans drive fast on straights and brake for corners. 
+            # If the steering angle is near 0.0, it goes 3.0 m/s.
+            # If the steering angle is sharp (e.g., 0.8 rad), it slows down safely to ~1.5 m/s.
+            target_speed = max(1.5, 3.0 - (abs(target_steering) * 2.5))
+
+            # --- 5. PUBLISH COMMAND ---
             cmd = AckermannDrive()
             cmd.speed = float(target_speed)
             cmd.steering_angle = float(target_steering)
             self._control_pub.publish(cmd)
-                        
-            # Drawing logic
+
+            # --- 6. DRAWING LOGIC ---
+            poly_px = (np.add(left_fit, right_fit) / 2)
+            est_xte_val, est_he_val, camera_px, closest_px = self.compute_error(poly_px)
+            
             ploty = ret['ploty']
-            left_fitx = np.polyval(ret["left_fit"], ploty)
+            left_fitx = np.polyval(left_fit, ploty) 
             center_fitx = np.polyval(poly_px, ploty)
-            right_fitx = np.polyval(ret["right_fit"], ploty)
+            right_fitx = np.polyval(right_fit, ploty) 
             
             pts_left = np.stack((left_fitx, ploty), axis=1).astype(np.int32)
             pts_center = np.stack((center_fitx, ploty), axis=1).astype(np.int32)
@@ -152,15 +241,13 @@ class LaneVisualizer(Node):
             cv2.polylines(binary_BEV, [pts_left], isClosed=False, color=(255, 0, 0), thickness=4)
             cv2.polylines(binary_BEV, [pts_right], isClosed=False, color=(0, 0, 255), thickness=4)
 
-            cv2.circle(binary_BEV, (int(closest_px[0]), int(closest_px[1])), 8, (0, 255, 0), -1)
-            cv2.line(binary_BEV, (int(camera_px[0]), int(camera_px[1])), (int(closest_px[0]), int(closest_px[1])), (0, 255, 0), 4)
+            # Draw a bright purple circle where the car is ACTUALLY aiming
+            cv2.circle(binary_BEV, (int(target_x_px), int(lookahead_y_px)), 12, (255, 0, 255), -1)
 
             XTE = f"{est_xte_val:.2f}"
             HE = f"{np.degrees(est_he_val):.2f}"
 
-        # Ground Truth lookup
         try:
-            # Note: For Gazebo sim, the frame might be "world" or "map"
             trans = self._tf_buf.lookup_transform("world", "base_link", msg.header.stamp)
             pos = trans.transform.translation
             rotation = R.from_quat([trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z, trans.transform.rotation.w])
@@ -352,14 +439,26 @@ class LaneVisualizer(Node):
             self.get_logger().debug("Model unable to detect lanes")
         return combine_fit_img, binary_warped, ret
 
-
 def main(args=None):
     rclpy.init(args=args)
     node = LaneVisualizer()
-    rclpy.spin(node)
-    if rclpy.ok():
-        rclpy.shutdown()
-
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        print("\nShutting down! Stopping the car...")
+        stop_cmd = AckermannDrive()
+        stop_cmd.speed = 0.0
+        stop_cmd.steering_angle = 0.0
+        
+        # Force the message out by spinning the executor briefly
+        for _ in range(10):
+            node._control_pub.publish(stop_cmd)
+            rclpy.spin_once(node, timeout_sec=0.05)
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

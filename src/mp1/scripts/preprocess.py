@@ -4,7 +4,6 @@ import numpy as np
 
 from dataset import CaptureDataset
 
-
 def mask_by_hsv(image, target_hsv, tolerance):
     if isinstance(tolerance, int):
         tol_h, tol_s, tol_v = tolerance, tolerance, tolerance
@@ -50,25 +49,43 @@ if __name__ == "__main__":
     ds = CaptureDataset("data/capture")
 
     yellow_lane = [30, 255, 255]
-    white_lane = [0, 0, 255]
 
     for i in range(len(ds)):
         image, _ = ds.read(i)
+        height, width = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # 1. Yellow Lanes
         yellow_mask = mask_by_hsv(image, yellow_lane, [10, 100, 150])    
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, white_mask = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
+        
+        # 2. Strict White Lanes
+        lower_white = np.array([0, 0, 200])
+        upper_white = np.array([180, 40, 255])
+        white_mask = cv2.inRange(hsv, lower_white, upper_white)
         
         thresh = cv2.bitwise_or(yellow_mask, white_mask)
 
-        h, w = thresh.shape
-        mask = np.zeros((h + 2, w + 2), np.uint8)
+        # 3. AGGRESSIVE HORIZON CROP
+        thresh[:int(height * 0.55), :] = 0
+        
+        # 4. SUPERCHARGED ANTI-CONE MASK
+        # Cones span the red/orange hue wrap-around and can have shadows (lower sat/val)
+        lower_orange1 = np.array([0, 80, 80])
+        upper_orange1 = np.array([25, 255, 255])
+        lower_orange2 = np.array([170, 80, 80])
+        upper_orange2 = np.array([180, 255, 255])
+        
+        mask1 = cv2.inRange(hsv, lower_orange1, upper_orange1)
+        mask2 = cv2.inRange(hsv, lower_orange2, upper_orange2)
+        orange_mask = cv2.bitwise_or(mask1, mask2)
+        
+        # Cones are tall. Use a massive vertically biased kernel to stretch the mask 
+        # up and down over the white stripes and the base.
+        kernel = np.ones((80, 40), np.uint8) 
+        cone_mask = cv2.dilate(orange_mask, kernel, iterations=1)
+        
+        # Erase!
+        thresh[cone_mask > 0] = 0
 
-        floodfill = thresh.copy()
-        for x in range(w):
-            if floodfill[0, x] == 255:
-                cv2.floodFill(floodfill, mask, (x, 0), 128)
-
-        top_region_mask = (floodfill == 128)
-        thresh[top_region_mask] = 0
-    
         ds.write_mask(thresh, i)
+        print(f"Processed image {i+1}/{len(ds)}")
